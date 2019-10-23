@@ -1,3 +1,10 @@
+# Convolutional Capsule-networks
+* Forked from Gram-ai: https://github.com/gram-ai/capsule-networks.
+* Modified to eliminate the assumption of (28*28) input size.
+* todo: decoder
+* todo: showcase demo 
+
+# Original Repo:
 # Dynamic Routing Between Capsules
 
 A barebones CUDA-enabled PyTorch implementation of the CapsNet architecture in the paper "Dynamic Routing Between Capsules" by [Kenta Iwasaki](https://github.com/iwasaki-kenta) on behalf of Gram.AI.
