@@ -3,20 +3,19 @@ Dynamic Routing Between Capsules
 https://arxiv.org/abs/1710.09829
 PyTorch implementation by Kenta Iwasaki @ Gram.AI.
 """
+from typing import Union, Tuple
+import sys
+from collections import OrderedDict
+import numpy as np
 import torch
-from torch.autograd import Variable
 import torch.nn.functional as F
 from torch import nn
-import numpy as np
-import sys
+
 import logging
-from typing import Tuple
-from functools import reduce
-from operator import mul
-from collections import OrderedDict
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 sys.setrecursionlimit(15000)
-logging.basicConfig(level=logging.DEBUG)
 
 
 def softmax(inputs, dim=1):
@@ -44,14 +43,13 @@ class CapsuleLayer(nn.Module):
 
     def __init__(self, num_capsules, num_route_nodes, in_channels, out_channels, kernel_size=None, stride=None,
                  num_iterations=None):
-        super(CapsuleLayer, self).__init__()
+        super().__init__()
         if num_iterations is None:
-            num_iterations = type(self).NUM_ROUTING_ITERATIONS
+            num_iterations = CapsuleLayer.NUM_ROUTING_ITERATIONS
         self.num_route_nodes = num_route_nodes
         self.num_iterations = num_iterations
 
         self.num_capsules = num_capsules
-
         if num_route_nodes != -1:
             self.route_weights = nn.Parameter(
                 torch.randn(num_capsules, num_route_nodes, in_channels, out_channels))
@@ -68,17 +66,21 @@ class CapsuleLayer(nn.Module):
         return scale * tensor / torch.sqrt(squared_norm)
 
     def forward(self, x):
-        if self.num_route_nodes != -1:
-            # x: N ,  [1],   num_nodes, [1],        VECTOR_DIM
-            # W: [1]  CLASS, num_nodes, VICTOR_DIM, POSE_DIM)
+        if self.num_route_nodes > 0:
+            # x: N ,  [1],   num_route_nodes, [1],        VECTOR_DIM
+            # W: [1]  CLASS, num_route_nodes, VECTOR_DIM, POSE_DIM)
+
+            # priors: N, Class, num_nomdes, 1, POSE_DIM (VECTOR_DIM collapsed in mul, while other are fore
+            # broadcasting)
+            # todo memory consumption too huge
             priors = x[:, None, :, None, :] @ self.route_weights[None, :, :, :, :]
 
-            logits = Variable(torch.zeros(*priors.size())).cuda()
+            logits = torch.zeros(*priors.size()).to(x.device)
             assert self.num_iterations > 0
             outputs = None
             for i in range(self.num_iterations):
-                probs = softmax(logits, dim=2)
-                outputs = self.squash((probs * priors).sum(dim=2, keepdim=True))
+                probabilities = softmax(logits, dim=2)
+                outputs = self.squash((probabilities * priors).sum(dim=2, keepdim=True))
 
                 if i != self.num_iterations - 1:
                     delta_logits = (priors * outputs).sum(dim=-1, keepdim=True)
@@ -99,14 +101,118 @@ class CapsuleLayer(nn.Module):
         return outputs
 
 
-class CapsuleNet(nn.Module):
-    CONV_SIZE: int = 3
-    @property
-    def num_classes(self):
-        return self._num_classes
+class BasicBlock(nn.Module):
+    def __init__(self, in_channels: int,
+                 out_channels: int,
+                 kernel_size: int = 3,
+                 stride: int = 2):
+        super().__init__()
+        self.features = nn.Sequential(OrderedDict([
+                ('pad', nn.ReflectionPad2d(padding=kernel_size//2)),
+                ('conv', nn.Conv2d(in_channels=in_channels,
+                                   out_channels=out_channels,
+                                   kernel_size=kernel_size,
+                                   stride=stride,
+                                   bias=False,
+                                   )
+                 ),
+                ('batchnorm', nn.BatchNorm2d(num_features=out_channels)),
+                ('relu', nn.ReLU(inplace=True))
+                ]
+            ))
+
+    def forward(self, x):
+        return self.features(x)
+
+
+class ResizeConv(nn.Module):
+
+    def __init__(self, in_channels: int,
+                 out_channels: int,
+                 kernel_size: int = 3,
+                 target_size: Union[int, Tuple[int, ...]] = None,
+                 scale_factor: Union[float, Tuple[float, ...]] = None,
+                 mode: str = 'bilinear'):
+        super().__init__()
+        self.features = nn.Sequential(OrderedDict([
+                ('up', nn.Upsample(size=target_size, scale_factor=scale_factor, mode=mode, align_corners=True)),
+                ]
+            ))
+        self.features.add_module('conv_block',
+                                 BasicBlock(in_channels=in_channels,
+                                            out_channels=out_channels,
+                                            kernel_size=kernel_size,
+                                            stride=1))
+
+    def forward(self, x):
+        return self.features(x)
+
+
+class ConvDecoder(nn.Module):
 
     @staticmethod
-    def bn_block(in_channel: int, out_channel: int, bn_channel: int = 32, bottom_stride: int = 2) -> nn.Module:
+    def size_fixation(length: int):
+        num_downsample = int(np.ceil(np.log2(length)))
+        size_recover = 2**num_downsample
+        factor = length/size_recover
+        return factor
+
+    def __init__(self,
+                 patch_shape,
+                 in_channels,
+                 kernel_size: int = 3):
+        super().__init__()
+        height, width, final_out_channel = patch_shape
+
+        # for convenience and sake of earlier torch version, assume the fixation factor is homogeneous.
+        height_f = ConvDecoder.size_fixation(height)
+        weight_f = ConvDecoder.size_fixation(width)
+        assert height_f == weight_f, f"Inconsistent fixation {[height_f, weight_f]}. {[height, width]}"
+        num_upsample = int(np.ceil(np.log2(height)))
+        map_channel = final_out_channel * (2**num_upsample)
+        self.features = nn.Sequential()
+        init_mapping = BasicBlock(in_channels=in_channels, out_channels=map_channel,
+                                  kernel_size=1, stride=1)
+        self.features.add_module('init', init_mapping)
+
+        in_channels_upsample = map_channel
+        for x in range(num_upsample):
+            resize_block = ResizeConv(in_channels=in_channels_upsample,
+                                      out_channels=in_channels_upsample//2,
+                                      kernel_size=kernel_size,
+                                      scale_factor=2)
+            self.features.add_module(f'resize_{x}', resize_block)
+            in_channels_upsample //= 2
+        if height_f == 1:
+            return
+        fixation = ResizeConv(in_channels=in_channels_upsample,
+                              out_channels=in_channels_upsample//2,
+                              kernel_size=1,
+                              scale_factor=height_f)
+        self.features.add_module(f"fixation", fixation)
+
+    def forward(self, x):
+        return self.features(x)
+
+
+class ConvEncoder(nn.Module):
+
+    @staticmethod
+    def bn_block(in_channel: int,
+                 out_channel: int,
+                 bn_channel: int = 32,
+                 bottom_stride: int = 2) -> nn.Module:
+        """
+        Borrowed from torchvision. Do not use that for the baseline
+        Args:
+            in_channel ():
+            out_channel ():
+            bn_channel ():
+            bottom_stride ():
+
+        Returns:
+
+        """
         return nn.Sequential(OrderedDict([
             ('conv1', nn.Conv2d(in_channel, out_channels=bn_channel, kernel_size=1, stride=1, padding=0, bias=True)),
             ('relu1', nn.ReLU(inplace=True)),
@@ -119,17 +225,65 @@ class CapsuleNet(nn.Module):
          ]
         ))
 
-    def _init_block(self, patch_shape: Tuple[int, int, int],
-                    init_feature: int = 32,
-                    growth_rate: int = 32,
-                    init_kernel_size: int = 7,
-                    init_config: Tuple[int, ...] = (1, 1)
-                    ):
+    @staticmethod
+    def down_path(patch_shape: Tuple[int, int, int],
+                  init_feature_power: int = 5,
+                  init_kernel_size: int = 7,
+                  path_kernel_size: int = 3,
+                  depth: int = 4):
+        """
+
+        Args:
+            patch_shape ():
+            init_feature_power ():
+            init_kernel_size ():
+            path_kernel_size ():
+            depth (): Includes 1st layer.
+
+        Returns:
+
+        """
+        assert len(patch_shape) == 3, 'Patch Shape must be 3d. Add singleton dimension if required.'
+        assert depth > 0, f'Positive Depth{depth}'
+
+        height, width, in_channels = patch_shape
+        kernel_size_list = (init_kernel_size, ) + (path_kernel_size, ) * (depth - 1)
+        # layer id s
+        out_channels = 2**init_feature_power
+        features = nn.Sequential()
+        for idx, kernel in enumerate(kernel_size_list):
+            features.add_module(f"block_{idx}", BasicBlock(in_channels=in_channels,
+                                                           out_channels=out_channels,
+                                                           kernel_size=kernel))
+            in_channels = out_channels
+            out_channels *= 2
+        # features and final # of channels
+        return features, in_channels
+
+    @staticmethod
+    def _init_block_bn(patch_shape: Tuple[int, int, int],
+                       init_feature: int = 32,
+                       growth_rate: int = 32,
+                       init_kernel_size: int = 7,
+                       init_config: Tuple[int, ...] = (1, 1)
+                       ):
+        """
+        Old approach. Redundant conv feature extractor
+        Args:
+            patch_shape ():
+            init_feature ():
+            growth_rate ():
+            init_kernel_size ():
+            init_config ():
+
+        Returns:
+
+        """
         assert len(patch_shape) == 3, 'Patch Shape must be 3d. Add singleton dimension if required.'
         height, width, in_channels = patch_shape
         features = nn.Sequential(OrderedDict([
             ('conv0', nn.Conv2d(in_channels, init_feature, kernel_size=init_kernel_size, stride=2,
-                                padding=init_kernel_size//2, bias=False)),
+                                padding=init_kernel_size // 2, bias=False)),
             # ('norm0', nn.BatchNorm2d(init_feature)),
             ('relu0', nn.ReLU(inplace=True)),
         ]))
@@ -142,9 +296,9 @@ class CapsuleNet(nn.Module):
                     stride = 1
                 else:
                     stride = 2
-                btn_layer = type(self).bn_block(num_in_channels,
+                btn_layer = CapsuleNet.bn_block(num_in_channels,
                                                 num_in_channels + growth_rate,
-                                                bn_channel=num_in_channels//2,
+                                                bn_channel=num_in_channels // 2,
                                                 bottom_stride=stride)
                 # print(btn_layer)
                 features.add_module('bn_%d_%d' % (idx + 1, ii + 1), btn_layer)
@@ -152,47 +306,89 @@ class CapsuleNet(nn.Module):
         # print(num_in_channels)
         return features, num_in_channels
 
+    def __init__(self,
+                 patch_shape: Tuple[int, int, int],
+                 init_feature_power: int = 5,
+                 init_kernel_size: int = 7,
+                 path_kernel_size: int = 3,
+                 depth: int = 4):
+        super().__init__()
+        features, final_channel = ConvEncoder.down_path(
+            patch_shape,
+            init_feature_power,
+            init_kernel_size=init_kernel_size,
+            path_kernel_size=path_kernel_size,
+            depth=depth
+        )
+        self.features = features
+        self.final_channel = final_channel
+
+    @property
+    def depth(self):
+        return len(self.features)
+
+    def forward(self, x):
+        return self.features(x)
+
+
+class CapsuleNet(nn.Module):
+    CONV_SIZE: int = 3
+    @property
+    def num_classes(self):
+        return self._num_classes
+
+    @property
+    def device(self):
+        return self.__device
+
     def __init__(self, patch_shape: Tuple[int, int, int],
                  num_classes: int = 10,
-                 init_feature: int = 32,
-                 growth_rate: int = 32,
-                 init_kernel_size: int = 3,
-                 init_config: Tuple[int, ...] = (2, 2),
+                 init_feature_power: int = 5,
+                 init_kernel_size: int = 7,
+                 down_kernel_size: int = 3,
+                 up_kernel_size: int = 3,
+                 depth: int = 4,
                  primary_caps_num: int = 16,
-                 primary_kernel_size: int = 9,
+                 primary_kernel_size: int = 3,
                  primary_kernel_num: int = 8,
                  pose_dim: int = 16,
                  ):
-        super(CapsuleNet, self).__init__()
-        width, height, in_channels = patch_shape
+        super().__init__()
+        height, width, in_channels = patch_shape
 
+        # dimension-settings
         self._num_classes = num_classes
         self._pose_dim = pose_dim
 
-        self.initial_conv, num_in_channels = self._init_block(patch_shape,
-                                                              init_feature, growth_rate, init_kernel_size, init_config)
-
+        # prepare initial down-sampling blocks
+        self.initial_conv = ConvEncoder(patch_shape=patch_shape,
+                                        init_feature_power=init_feature_power,
+                                        init_kernel_size=init_kernel_size,
+                                        path_kernel_size=down_kernel_size,
+                                        depth=depth
+                                        )
+        num_in_channels = self.initial_conv.final_channel
         self.primary_capsules = CapsuleLayer(num_capsules=primary_caps_num, num_route_nodes=-1,
                                              in_channels=num_in_channels,
                                              out_channels=primary_kernel_num,
                                              kernel_size=primary_kernel_size, stride=2)
-        # plus 2 for - init conv, primary
-        w = (width // 2**(len(init_config) + 1) - (primary_kernel_size-1)) // 2
-        h = (height // 2**(len(init_config) + 1) - (primary_kernel_size-1)) //2
-        # logging.debug(f"W:{w}, H{h}, C:{primary_caps_num}")
+        # extra division of 2 for primary caps
+        # calculate width and height after down-sampling and primary kernel
+        downsample_factor = 2**self.initial_conv.depth
+        width_down = (width // downsample_factor - (primary_kernel_size-1)) // 2
+        height_down = (height // downsample_factor - (primary_kernel_size-1)) // 2
+
+        logger.debug(f"W:{width_down}, H{height_down}, C:{primary_caps_num}")
+        assert width_down > 0 and height_down > 0, f"In correct size. Check depth. {width_down, height_down}"
+
         self.digit_capsules = CapsuleLayer(num_capsules=self.num_classes,
-                                           num_route_nodes=primary_caps_num * w*h,
+                                           num_route_nodes=primary_caps_num * width_down*height_down,
                                            in_channels=primary_kernel_num,
                                            out_channels=pose_dim)
 
-        self.decoder = nn.Sequential(
-            nn.Linear(self._pose_dim * self.num_classes, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, 1024),
-            nn.ReLU(inplace=True),
-            nn.Linear(1024, reduce(mul, patch_shape)),
-            nn.Sigmoid()
-        )
+        in_channels_decoder = self._pose_dim * self.num_classes
+        self.decoder = ConvDecoder(patch_shape=patch_shape, in_channels=in_channels_decoder,
+                                   kernel_size=up_kernel_size)
 
     def forward(self, x, y=None):
         x = self.initial_conv(x)
@@ -205,13 +401,13 @@ class CapsuleNet(nn.Module):
 
         classes = (x ** 2).sum(dim=-1) ** 0.5  # probability as magnitude of vector (length)
         classes = F.softmax(classes, dim=-1)
-
         if y is None:
             # In all batches, get the most active capsule.
             _, max_length_indices = classes.max(dim=1)
-            y = Variable(torch.eye(self.num_classes)).cuda().index_select(dim=0, index=max_length_indices.data)
+            y = torch.eye(self.num_classes).to(x.device).index_select(dim=0, index=max_length_indices.data)
         decoder_input = (x * y[:, :, None]).view(batch_size, -1)
-
+        # batch * (pose*class) * 1 * 1
+        decoder_input = decoder_input[:, :, None, None]
         # logging.debug(f"\n{x.shape}|{y.shape}|{(x * y[:, :, None]).shape}|DecoderInput:{decoder_input.shape}")
         reconstructions = self.decoder(decoder_input)
 
